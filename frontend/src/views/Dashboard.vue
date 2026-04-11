@@ -61,7 +61,7 @@
                 {{ row.downloaded_count }}/{{ row.total_count }}
               </span>
             </div>
-            <div v-if="row.progress_message" style="font-size: 12px; color: #606266; line-height: 1.4;">
+            <div v-if="row.progress_message" style="font-size: 12px; color: #606266; line-height: 1.6; white-space: pre-line;">
               {{ row.progress_message }}
             </div>
             <span v-else-if="!row.total_count" style="color: #c0c4cc; font-size: 12px;">--</span>
@@ -74,7 +74,7 @@
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="250" fixed="right">
           <template #default="{ row }">
             <el-button
               v-if="row.status === 'pending' || row.status === 'failed'"
@@ -84,6 +84,25 @@
               @click="handleStart(row.id)"
             >
               <el-icon><VideoPlay /></el-icon> 开始
+            </el-button>
+            <el-button
+              v-if="row.failed_count > 0 && row.status !== 'running'"
+              type="success"
+              size="small"
+              link
+              @click="handleRetryFailed(row.id)"
+              :loading="retryingTaskId === row.id"
+            >
+              <el-icon><RefreshRight /></el-icon> 重试失败
+            </el-button>
+            <el-button
+              v-if="row.failed_count > 0"
+              type="warning"
+              size="small"
+              link
+              @click="showFailedDetail(row.id)"
+            >
+              <el-icon><Warning /></el-icon> 失败详情
             </el-button>
             <el-button
               type="info"
@@ -104,17 +123,35 @@
         </el-table-column>
       </el-table>
     </el-card>
+
+    <el-dialog v-model="failedDialogVisible" title="下载失败详情" width="600px">
+      <pre style="white-space: pre-wrap; word-break: break-all; font-size: 13px; line-height: 1.8; max-height: 400px; overflow-y: auto; background: #fafafa; padding: 16px; border-radius: 8px;">{{ failedContent }}</pre>
+      <template #footer>
+        <el-button
+          type="success"
+          @click="handleRetryFromDialog"
+          :loading="retryingTaskId === failedTaskId"
+        >
+          重试下载失败文件
+        </el-button>
+        <el-button @click="failedDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { Plus, VideoPlay, Refresh, Delete } from '@element-plus/icons-vue'
+import { Plus, VideoPlay, Refresh, RefreshRight, Delete, Warning } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 
 const tasks = ref([])
 const loading = ref(false)
+const failedDialogVisible = ref(false)
+const failedContent = ref('')
+const failedTaskId = ref(null)
+const retryingTaskId = ref(null)
 let pollTimer = null
 
 const runningCount = computed(() => tasks.value.filter(t => t.status === 'running').length)
@@ -170,6 +207,47 @@ async function handleRefresh(id) {
     if (idx >= 0) tasks.value[idx] = data
   } catch (e) {
     console.error(e)
+  }
+}
+
+async function showFailedDetail(id) {
+  try {
+    const { data } = await api.getFailedList(id)
+    failedContent.value = data.content || '没有失败记录'
+    failedTaskId.value = id
+    failedDialogVisible.value = true
+  } catch (e) {
+    ElMessage.error('获取失败详情失败')
+  }
+}
+
+async function handleRetryFailed(id) {
+  retryingTaskId.value = id
+  try {
+    const { data } = await api.retryFailed(id)
+    if (data.still_failed === 0) {
+      ElMessage.success(`重试完成！全部 ${data.success} 个文件下载成功`)
+    } else {
+      ElMessage.warning(`重试完成：成功 ${data.success}，仍失败 ${data.still_failed}`)
+    }
+    await fetchTasks()
+  } catch (e) {
+    ElMessage.error('重试失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    retryingTaskId.value = null
+  }
+}
+
+async function handleRetryFromDialog() {
+  if (!failedTaskId.value) return
+  await handleRetryFailed(failedTaskId.value)
+  if (retryingTaskId.value === null) {
+    const { data } = await api.getFailedList(failedTaskId.value)
+    if (!data.content) {
+      failedDialogVisible.value = false
+    } else {
+      failedContent.value = data.content
+    }
   }
 }
 

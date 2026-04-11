@@ -12,6 +12,8 @@ export default {
   createTask: (data) => api.post('/api/tasks', data),
   startTask: (id) => api.post(`/api/tasks/${id}/start`),
   deleteTask: (id) => api.delete(`/api/tasks/${id}`),
+  getFailedList: (id) => api.get(`/api/tasks/${id}/failed`),
+  retryFailed: (id) => api.post(`/api/tasks/${id}/retry-failed`, null, { timeout: 300000 }),
 
   // Providers
   listProviders: () => api.get('/api/providers'),

@@ -71,6 +71,7 @@ class AsyncDownloader:
         save_dir: Path,
         index: int = 0,
         headers: dict[str, str] | None = None,
+        max_retries: int = 3,
     ) -> tuple[bool, str]:
         """下载单个文件，返回 (是否成功, 文件路径或错误信息)。"""
         filename = self._sanitize_filename(self._resolve_filename(item, index))
@@ -80,17 +81,26 @@ class AsyncDownloader:
             return True, str(filepath)
 
         session = await self._get_session()
-        try:
-            async with session.get(item.url, headers=headers) as resp:
-                if resp.status != 200:
-                    return False, f"HTTP {resp.status}"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                content = await resp.read()
-                filepath.write_bytes(content)
-                return True, str(filepath)
-        except Exception as e:
-            logger.warning("Download failed %s: %s", item.url, e)
-            return False, str(e)
+        last_error = ""
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with session.get(item.url, headers=headers) as resp:
+                    if resp.status == 200:
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        content = await resp.read()
+                        filepath.write_bytes(content)
+                        return True, str(filepath)
+                    last_error = f"HTTP {resp.status}"
+                    if resp.status in (403, 404):
+                        break
+            except Exception as e:
+                last_error = str(e)
+                logger.warning("Download attempt %d/%d failed %s: %s", attempt, max_retries, item.url[:100], e)
+
+            if attempt < max_retries:
+                await asyncio.sleep(2 * attempt)
+
+        return False, last_error
 
     async def download_batch(
         self,
@@ -98,30 +108,37 @@ class AsyncDownloader:
         save_dir: Path,
         headers: dict[str, str] | None = None,
         progress_callback: Any = None,
-    ) -> tuple[int, int]:
-        """批量下载，返回 (成功数, 失败数)。"""
+    ) -> tuple[int, int, list[dict]]:
+        """批量下载，返回 (成功数, 失败数, 失败详情列表)。"""
         semaphore = asyncio.Semaphore(self.max_concurrent)
         success_count = 0
         fail_count = 0
+        failed_details: list[dict] = []
 
-        async def _download_with_sem(item: MediaItem, idx: int) -> bool:
+        async def _download_with_sem(item: MediaItem, idx: int) -> tuple[MediaItem, bool, str]:
             async with semaphore:
                 ok, msg = await self.download_one(item, save_dir, idx, headers)
                 if ok:
                     logger.debug("Downloaded: %s", msg)
                 else:
-                    logger.warning("Failed: %s -> %s", item.url, msg)
-                return ok
+                    logger.warning("Failed: %s -> %s", item.filename or item.url[:80], msg)
+                return item, ok, msg
 
-        tasks = [_download_with_sem(item, i) for i, item in enumerate(items)]
+        tasks_list = [_download_with_sem(item, i) for i, item in enumerate(items)]
 
-        for i, coro in enumerate(asyncio.as_completed(tasks)):
-            result = await coro
-            if result:
+        for coro in asyncio.as_completed(tasks_list):
+            item, ok, msg = await coro
+            if ok:
                 success_count += 1
             else:
                 fail_count += 1
+                failed_details.append({
+                    "filename": item.filename or "unknown",
+                    "source_id": item.source_id or "",
+                    "url": item.url,
+                    "error": msg,
+                })
             if progress_callback:
                 await progress_callback(success_count + fail_count, len(items))
 
-        return success_count, fail_count
+        return success_count, fail_count, failed_details

@@ -227,6 +227,42 @@ def _sync_fetch_collects_list_impl(cookie: str) -> list[dict]:
     return folders
 
 
+def _sync_refresh_cookies() -> str:
+    """快速打开浏览器获取最新 Cookie，不需要滚动或抓取数据。"""
+    from playwright.sync_api import sync_playwright
+
+    with _browser_lock:
+        Path(_BROWSER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+        p = sync_playwright().start()
+        try:
+            context = p.chromium.launch_persistent_context(
+                _BROWSER_DATA_DIR,
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+                locale="zh-CN",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/135.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            cookies = context.cookies("https://www.douyin.com")
+            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+            logger.info("Refreshed cookies: %d cookies fetched", len(cookies))
+
+            context.close()
+            return cookie_str
+        except Exception as e:
+            logger.error("Failed to refresh cookies: %s", e)
+            return ""
+        finally:
+            p.stop()
+
+
 def _sync_fetch_douyin_page(
     source_type: str,
     page_num: int,
@@ -237,6 +273,15 @@ def _sync_fetch_douyin_page(
     Returns:
         (aweme_list, has_more, browser_cookie_str)
     """
+    with _browser_lock:
+        return _sync_fetch_douyin_page_impl(source_type, page_num, cookie)
+
+
+def _sync_fetch_douyin_page_impl(
+    source_type: str,
+    page_num: int,
+    cookie: str,
+) -> tuple[list[dict], bool, str]:
     from playwright.sync_api import sync_playwright
 
     Path(_BROWSER_DATA_DIR).mkdir(parents=True, exist_ok=True)
@@ -368,10 +413,11 @@ def _sync_fetch_douyin_page(
         except Exception as e:
             logger.warning("进入收藏夹失败: %s", e)
 
-    scroll_count = max(page_num + 2, 5)
-    logger.info("Page loaded, scrolling %d times...", scroll_count)
+    max_scroll = 500
+    logger.info("Page loaded, scrolling until all content loaded (max %d)...", max_scroll)
     no_new_count = 0
-    for scroll in range(scroll_count):
+    prev_aweme_total = 0
+    for scroll in range(max_scroll):
         prev_count = len(captured_data)
         try:
             page.evaluate("""
@@ -385,15 +431,26 @@ def _sync_fetch_douyin_page(
             break
         page.wait_for_timeout(3000)
         new_captured = len(captured_data) - prev_count
-        logger.info("  Scroll %d done, captured: %d total (%d new)", scroll + 1, len(captured_data), new_captured)
 
-        if new_captured == 0:
+        cur_aweme_total = sum(len(d.get("aweme_list") or []) for d in captured_data)
+        logger.info(
+            "  Scroll %d done, API responses: %d total (%d new), awemes: %d",
+            scroll + 1, len(captured_data), new_captured, cur_aweme_total,
+        )
+
+        if new_captured == 0 and cur_aweme_total == prev_aweme_total:
             no_new_count += 1
-            if no_new_count >= 3 and len(captured_data) > 0:
-                logger.info("  连续 %d 次无新数据，停止滚动", no_new_count)
+            if no_new_count >= 5 and len(captured_data) > 0:
+                logger.info("  连续 %d 次无新数据，所有内容已加载完毕", no_new_count)
                 break
         else:
             no_new_count = 0
+
+        prev_aweme_total = cur_aweme_total
+
+        if scroll > 0 and scroll % 20 == 0:
+            logger.info("  已滚动 %d 次，暂停 5 秒防止限流...", scroll)
+            page.wait_for_timeout(5000)
 
     all_awemes = []
     has_more = False
@@ -469,94 +526,75 @@ class DouyinProvider(BaseProvider):
         progress_callback: Any = None,
     ) -> list[MediaItem]:
         source_type = target.extra.get("source_type", "favorite")
-        logger.info("fetch_media_list: douyin %s, pages=%d-%s", source_type, start_page, end_page or "∞")
+        logger.info("fetch_media_list: douyin %s", source_type)
+
+        if progress_callback:
+            await progress_callback(0, "正在打开浏览器并加载内容...")
+
+        try:
+            loop = asyncio.get_event_loop()
+            aweme_list, has_more, browser_cookie = await loop.run_in_executor(
+                _executor,
+                _sync_fetch_douyin_page,
+                source_type,
+                1,
+                self._cookie,
+            )
+            if browser_cookie:
+                self._browser_cookie = browser_cookie
+        except Exception as e:
+            logger.error("Fetch failed: %s", e)
+            return []
 
         media_items: list[MediaItem] = []
-        page = 1
         seen_ids: set[str] = set()
 
-        while True:
-            in_range = page >= start_page
+        for aweme in aweme_list:
+            aweme_id = str(aweme.get("aweme_id", ""))
+            if not aweme_id or aweme_id in seen_ids:
+                continue
+            seen_ids.add(aweme_id)
 
-            try:
-                loop = asyncio.get_event_loop()
-                with _browser_lock:
-                    aweme_list, has_more, browser_cookie = await loop.run_in_executor(
-                        _executor,
-                        _sync_fetch_douyin_page,
-                        source_type,
-                        page,
-                        self._cookie,
+            aweme_type = aweme.get("aweme_type", 0)
+            desc = aweme.get("desc", "").strip()[:50]
+            author = aweme.get("author", {}).get("nickname", "unknown")
+            safe_desc = _sanitize_name(desc) if desc else aweme_id
+            safe_author = _sanitize_name(author)
+
+            if aweme_type == 68:
+                image_urls = _extract_images(aweme)
+                for idx, img_url in enumerate(image_urls):
+                    media_items.append(
+                        MediaItem(
+                            url=img_url,
+                            media_type=MediaType.IMAGE,
+                            source_id=f"{aweme_id}_img_{idx}",
+                            filename=f"{safe_author}_{safe_desc}_{idx}.jpg",
+                        )
                     )
-                if browser_cookie:
-                    self._browser_cookie = browser_cookie
-            except Exception as e:
-                logger.error("Fetch page %d failed: %s", page, e)
-                break
-
-            new_items = 0
-            for aweme in aweme_list:
-                aweme_id = str(aweme.get("aweme_id", ""))
-                if not aweme_id or aweme_id in seen_ids:
-                    continue
-                seen_ids.add(aweme_id)
-
-                if not in_range:
-                    continue
-
-                aweme_type = aweme.get("aweme_type", 0)
-                desc = aweme.get("desc", "").strip()[:50]
-                author = aweme.get("author", {}).get("nickname", "unknown")
-                safe_desc = _sanitize_name(desc) if desc else aweme_id
-                safe_author = _sanitize_name(author)
-
-                if aweme_type == 68:
-                    image_urls = _extract_images(aweme)
-                    for idx, img_url in enumerate(image_urls):
-                        media_items.append(
-                            MediaItem(
-                                url=img_url,
-                                media_type=MediaType.IMAGE,
-                                source_id=f"{aweme_id}_img_{idx}",
-                                filename=f"{safe_author}_{safe_desc}_{idx}.jpg",
-                            )
+            else:
+                video = aweme.get("video", {})
+                video_url = _extract_no_watermark_video_url(video)
+                if video_url:
+                    media_items.append(
+                        MediaItem(
+                            url=video_url,
+                            media_type=MediaType.VIDEO,
+                            source_id=aweme_id,
+                            filename=f"{safe_author}_{safe_desc}.mp4",
                         )
-                        new_items += 1
-                else:
-                    video = aweme.get("video", {})
-                    video_url = _extract_no_watermark_video_url(video)
-                    if video_url:
-                        media_items.append(
-                            MediaItem(
-                                url=video_url,
-                                media_type=MediaType.VIDEO,
-                                source_id=aweme_id,
-                                filename=f"{safe_author}_{safe_desc}.mp4",
-                            )
-                        )
-                        new_items += 1
+                    )
 
-            status_prefix = "" if in_range else "[跳过] "
-            if progress_callback:
-                await progress_callback(
-                    len(media_items),
-                    f"{status_prefix}第 {page} 页滚动，{new_items} 个新文件",
-                )
-
-            logger.info(
-                "%sPage %d: %d new items (total: %d, has_more: %s)",
-                status_prefix, page, new_items, len(media_items), has_more,
+        if progress_callback:
+            await progress_callback(
+                len(media_items),
+                f"内容加载完成，共 {len(media_items)} 个文件（{len(seen_ids)} 个作品）",
             )
 
-            if not has_more or not aweme_list:
-                break
-
-            page += 1
-            if end_page and page > end_page:
-                break
-
-            delay = random.uniform(2.0, 4.0)
-            await asyncio.sleep(delay)
+        logger.info(
+            "fetch_media_list done: %d items from %d awemes, has_more=%s",
+            len(media_items), len(seen_ids), has_more,
+        )
 
         return media_items
 
@@ -578,6 +616,14 @@ class DouyinProvider(BaseProvider):
                 ),
             }
         }
+
+    async def refresh_cookies(self) -> str:
+        """通过 Playwright 获取最新的浏览器 Cookie（用于重试下载）。"""
+        loop = asyncio.get_event_loop()
+        cookie_str = await loop.run_in_executor(_executor, _sync_refresh_cookies)
+        if cookie_str:
+            self._browser_cookie = cookie_str
+        return cookie_str
 
     async def validate_config(self, config: dict[str, Any]) -> bool:
         return True

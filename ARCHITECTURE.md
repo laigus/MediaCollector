@@ -154,9 +154,17 @@ _run_task():
     1. provider.parse_target(url)    → 获取目标信息
     2. db.get_downloaded_ids()       → 获取已下载 ID 集合
     3. provider.fetch_media_list()   → 分页抓取媒体列表（增量）
-    4. downloader.download_batch()   → 并发下载文件
+    4. downloader.download_batch()   → 并发下载文件（每个文件最多重试3次）
     5. 每下载一个 → db.add_downloaded_id() + 更新进度
-    6. 完成 → db.update_task(status=completed)
+    6. 失败的文件 → 保存 _failed.json + _下载失败列表.txt
+    7. 完成 → db.update_task(status=completed)
+
+retry_failed():
+    1. 读取 _failed.json 获取失败文件列表
+    2. provider.fetch_media_list()   → 重新获取最新 URL（CDN链接有时效）
+    3. 通过 source_id 或 filename 匹配失败项的新 URL
+    4. downloader.download_batch()   → 用新 URL 重新下载
+    5. 成功的从失败列表移除，仍失败的更新列表文件
 ```
 
 ### 4.4 微博 Provider 实现细节
@@ -329,6 +337,8 @@ class TaskCreate(BaseModel):
 | GET | `/api/tasks` | 任务列表 | — | `TaskInfo[]` |
 | GET | `/api/tasks/{id}` | 任务详情 | — | `TaskInfo` |
 | POST | `/api/tasks/{id}/start` | 启动任务 | — | `TaskInfo` |
+| GET | `/api/tasks/{id}/failed` | 获取失败文件列表 | — | `{content, count}` |
+| POST | `/api/tasks/{id}/retry-failed` | 重试失败文件 | — | `{retried, success, still_failed}` |
 | DELETE | `/api/tasks/{id}` | 删除任务 | — | `{ok}` |
 | GET | `/api/providers` | Provider 列表 | — | `ProviderInfo[]` |
 | GET | `/api/providers/{name}/config` | 读取配置 | — | `{config}` (敏感字段脱敏) |
@@ -351,6 +361,8 @@ class TaskCreate(BaseModel):
 
 `api.js` 导出的方法与后端一一对应：
 - `listTasks()`, `getTask(id)`, `createTask(data)`, `startTask(id)`, `deleteTask(id)`
+- `getFailedList(id)` — 获取失败文件详情
+- `retryFailed(id)` — 重试失败文件下载（超时 5 分钟）
 - `listProviders()`, `getProviderConfig(name)`, `updateProviderConfig(name, config)`
 - `getCollectsList(name)` — 获取抖音收藏夹列表（超时 5 分钟，因需要浏览器登录）
 - `health()`
@@ -388,6 +400,8 @@ WEIBO_COOKIE=                    # 微博 Cookie（可选，推荐通过 UI 配�
 4. **微博图片下载**：下载仍使用 aiohttp（非 Playwright），需要 `Referer: https://weibo.com/` header
 5. **抖音 CDN 认证**：抖音图片/视频 CDN 需要有效 Cookie（含 `tt_chain_token`），程序会自动从浏览器提取
 6. **抖音登录**：首次使用需扫码登录，登录状态保存在 `data/douyin_browser/` 持久化目录中
+7. **CDN 链接时效**：抖音图片/视频 URL 包含签名和过期时间，过期后返回 403。重试功能会重新获取最新 URL
+8. **下载重试**：每个文件自动重试 3 次（网络波动重试，403/404 跳过）。失败文件可通过 UI 一键重试
 
 ## 十、扩展指南
 
