@@ -31,18 +31,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS downloaded_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id INTEGER NOT NULL,
-    source_id TEXT NOT NULL,
-    downloaded_at TEXT NOT NULL,
-    UNIQUE(task_id, source_id)
-);
-
 CREATE TABLE IF NOT EXISTS provider_configs (
     provider TEXT PRIMARY KEY,
     config_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_failures (
+    task_id INTEGER PRIMARY KEY,
+    details_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS douyin_catalog (
+    source_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
 );
 """
 
@@ -61,6 +63,11 @@ class Database:
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_INIT_SQL)
+        await self._conn.execute(
+            """UPDATE tasks SET status = 'failed', progress_message = ?, updated_at = ?
+               WHERE status = 'running'""",
+            ("上次下载已中断", _now()),
+        )
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -109,13 +116,6 @@ class Database:
             return None
         return self._row_to_task(row)
 
-    async def list_tasks(self) -> list[TaskInfo]:
-        cursor = await self._conn.execute(
-            "SELECT * FROM tasks ORDER BY id DESC"
-        )
-        rows = await cursor.fetchall()
-        return [self._row_to_task(r) for r in rows]
-
     async def update_task(self, task_id: int, **kwargs: Any) -> None:
         if "status" in kwargs and isinstance(kwargs["status"], TaskStatus):
             kwargs["status"] = kwargs["status"].value
@@ -127,15 +127,23 @@ class Database:
         )
         await self._conn.commit()
 
-    async def delete_task(self, task_id: int) -> bool:
-        await self._conn.execute(
-            "DELETE FROM downloaded_items WHERE task_id = ?", (task_id,)
-        )
-        cursor = await self._conn.execute(
-            "DELETE FROM tasks WHERE id = ?", (task_id,)
-        )
+    async def get_task_failures(self, task_id: int) -> list[dict]:
+        async with self._conn.execute(
+            "SELECT details_json FROM task_failures WHERE task_id = ?", (task_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return json.loads(row["details_json"]) if row else []
+
+    async def save_task_failures(self, task_id: int, failures: list[dict]) -> None:
+        if failures:
+            await self._conn.execute(
+                """INSERT INTO task_failures (task_id, details_json) VALUES (?, ?)
+                   ON CONFLICT(task_id) DO UPDATE SET details_json = excluded.details_json""",
+                (task_id, json.dumps(failures, ensure_ascii=False)),
+            )
+        else:
+            await self._conn.execute("DELETE FROM task_failures WHERE task_id = ?", (task_id,))
         await self._conn.commit()
-        return cursor.rowcount > 0
 
     @staticmethod
     def _row_to_task(row: aiosqlite.Row) -> TaskInfo:
@@ -157,25 +165,26 @@ class Database:
             updated_at=row["updated_at"],
         )
 
-    # ── Downloaded Items (增量下载) ──
+    # ── Provider Configs ──
 
-    async def get_downloaded_ids(self, task_id: int) -> set[str]:
-        cursor = await self._conn.execute(
-            "SELECT source_id FROM downloaded_items WHERE task_id = ?",
-            (task_id,),
-        )
-        rows = await cursor.fetchall()
-        return {r["source_id"] for r in rows}
+    async def get_douyin_catalog(self, source_id: str) -> dict | None:
+        async with self._conn.execute(
+            "SELECT payload_json FROM douyin_catalog WHERE source_id = ?", (source_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return json.loads(row["payload_json"]) if row else None
 
-    async def add_downloaded_id(self, task_id: int, source_id: str) -> None:
+    async def save_douyin_catalog(self, source_id: str, payload: dict) -> None:
         await self._conn.execute(
-            """INSERT OR IGNORE INTO downloaded_items
-               (task_id, source_id, downloaded_at) VALUES (?, ?, ?)""",
-            (task_id, source_id, _now()),
+            """INSERT INTO douyin_catalog (source_id, payload_json) VALUES (?, ?)
+               ON CONFLICT(source_id) DO UPDATE SET payload_json = excluded.payload_json""",
+            (source_id, json.dumps(payload, ensure_ascii=False)),
         )
         await self._conn.commit()
 
-    # ── Provider Configs ──
+    async def clear_douyin_catalog(self) -> None:
+        await self._conn.execute("DELETE FROM douyin_catalog")
+        await self._conn.commit()
 
     async def get_provider_config(self, provider: str) -> dict[str, Any]:
         cursor = await self._conn.execute(
@@ -190,12 +199,13 @@ class Database:
     async def save_provider_config(
         self, provider: str, config: dict[str, Any]
     ) -> None:
+        patch_json = json.dumps(config, ensure_ascii=False)
         await self._conn.execute(
             """INSERT INTO provider_configs (provider, config_json, updated_at)
-               VALUES (?, ?, ?)
+               VALUES (?, json_patch('{}', ?), ?)
                ON CONFLICT(provider) DO UPDATE SET
-               config_json = excluded.config_json,
+               config_json = json_patch(provider_configs.config_json, ?),
                updated_at = excluded.updated_at""",
-            (provider, json.dumps(config, ensure_ascii=False), _now()),
+            (provider, patch_json, _now(), patch_json),
         )
         await self._conn.commit()

@@ -1,143 +1,55 @@
 # MediaCollector
 
-可扩展的媒体批量下载工具，支持从微博、抖音等多个平台批量下载壁纸/图片/视频。
-
-## 功能
-
-- **微博图片下载** — 输入用户主页 URL，自动抓取所有原图并批量下载
-- **抖音收藏/点赞下载** — 下载抖音收藏夹、收藏、点赞中的视频和图片（无水印）
-- **收藏夹分类下载** — 支持按抖音收藏夹分别下载到对应本地文件夹
-- **可扩展架构** — Provider 插件机制，轻松添加新平台
-- **Web UI** — 美观的浏览器管理界面，创建任务、查看进度、管理配置
-- **浏览器引擎** — 使用 Playwright 模拟真实浏览器，自动处理验证码和登录
-- **异步高性能** — 基于 aiohttp 的异步并发下载引擎，自动重试失败文件
-- **失败重试** — 下载失败的文件可一键重试，自动重新获取最新链接
+在本地浏览抖音收藏、选择作品下载，或批量保存微博账号的原图。两个平台各有独立页签，登录、保存位置、下载进度和失败重试都在对应页签内。
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 首次安装（Windows）
 
-```bash
-cd MediaCollector
-python -m venv venv
-.\venv\Scripts\activate      # Windows
-# source venv/bin/activate   # Linux/Mac
+安装 `uv` 后，在项目根目录打开 PowerShell，执行：
 
+```powershell
+uv venv --python 3.12 .venv
+uv pip install --python .\.venv\Scripts\python.exe -r backend\requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
+### 2. 一键启动
+
+双击项目根目录的 `start.bat`。脚本使用 `.venv` 启动后端，服务就绪后自动打开 [Web UI](http://localhost:8000)。保持命令窗口打开，按 `Ctrl+C` 停止服务；出现批处理结束提示时，输入 `Y` 并回车。
+
+## 抖音：打开收藏夹，挑选作品
+
+1. 打开「抖音」页签。点击路径栏左侧的文件夹图标，选择下载文件夹。
+2. 点击首页右上角的头像可查看昵称、抖音号和「退出登录」。未登录时点击「登录抖音」，在弹出的抖音窗口扫码。退出只清除下载器内的抖音会话和收藏缓存，保留下载目录和文件。
+3. 点「读取收藏夹」，再点一个收藏夹进入。程序会打开抖音里的收藏夹入口和所选收藏夹。也可直接打开「全部收藏」或「我的点赞」。
+4. 每个来源首次打开时读取作品，之后直接显示本地记录。点击「刷新收藏夹」或「刷新作品」同步变化；读取中点击「停止读取并返回」回到收藏首页。
+5. 顶部单独读取并显示实际保存路径，作品读取期间也可查看。需要单独指定时，点击左侧文件夹图标。作品可按视频、图集筛选，也可按标题或作者搜索。
+6. 勾选要下载的作品，点击「下载选中作品」。选中图集会下载该作品的全部图片。页内显示实际保存路径、进度和结果。
+
+## 微博：粘贴主页，下载原图
+
+1. 打开「微博」页签，点击路径栏左侧的文件夹图标选择目录，再输入微博主页链接或数字用户 ID。
+2. 「下载范围」可指定起止页。结束页填 0 表示下载到末页。
+3. 点击「下载微博原图」。如需登录，可先点击「登录微博」，在弹出的微博窗口登录；下载过程中弹出验证窗口时，在窗口内完成验证。登录状态会在本机保留。
+
+## 保存位置与重试
+
+- 系统文件夹选择窗口确认后立即保存；取消时保留原路径。首次下载前先选择目录，文件直接保存到选中的文件夹。
+- 两个平台分别保存路径。抖音在收藏来源内选择的路径仅用于该来源；未单独选择的来源使用抖音页签的路径。
+- 路径保存在本地 SQLite 数据库中。数据目录 `backend/data/` 由 Git 忽略。
+- 下载完成后，可在本页打开「失败详情」或点击「重试失败项」。重试会刷新下载链接，只下载失败文件。
+- 刷新页面后，对应页签会恢复最近一次下载的状态，直至关闭状态卡片或开始下一次下载。
+
+## 开发与验证
+
+后端使用 FastAPI、Playwright、aiohttp 与 SQLite，前端使用 Vue 3 与 Vite。Windows 启动脚本加载仓库中的前端构建产物，修改界面后按[前端开发说明](frontend/README.md)重新构建。
+
+本地端到端测试使用样例平台响应、文件夹选择结果和临时数据库。在项目根目录执行：
+
+```powershell
 cd backend
-pip install -r requirements.txt
-python -m playwright install chromium
+..\.venv\Scripts\python.exe -m tests.workspace_smoke
 ```
 
-### 2. 启动后端
-
-```bash
-cd backend
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-> **注意**：Windows 上不要使用 `--reload` 参数，否则 Playwright 可能无法正常工作。
-
-### 3. 访问 Web UI
-
-打开浏览器访问 http://localhost:8000
-
-### 4. 配置微博
-
-#### 方式一：自动登录（推荐）
-
-不需要手动配置 Cookie。首次创建微博任务时，如果需要登录或触发验证码，程序会**自动弹出浏览器窗口**，在其中完成登录/验证即可。登录状态会自动保存到 `backend/data/weibo_browser/`。
-
-#### 方式二：手动配置 Cookie
-
-1. 浏览器登录 https://m.weibo.cn
-2. F12 打开开发者工具 → Network → 刷新页面
-3. 点击任意请求，复制 Headers 中的 Cookie 值
-4. 在 Web UI 的「设置」页面粘贴保存
-
-### 5. 处理微博验证码
-
-微博有反爬机制，短时间内请求过多会触发验证码。如果遇到验证码错误：
-
-1. 在浏览器中访问 https://m.weibo.cn/captcha/show?backUrl=https%3A%2F%2Fm.weibo.cn%2F
-2. 完成验证码验证
-3. 回到 MediaCollector 重新创建任务
-
-程序也会在检测到验证码时自动弹出浏览器窗口让你操作。
-
-### 6. 创建下载任务
-
-#### 微博
-
-在「新建任务」页面：
-- 选择「微博」
-- 输入用户主页 URL（如 `https://weibo.com/u/6279793937`）
-- 设置页数范围（可选）
-- 点击「创建并立即开始」
-
-#### 抖音
-
-在「新建任务」页面：
-- 选择「抖音」
-- 从下拉菜单选择「我的收藏（全部）」或「我的点赞」
-- 或点击「加载收藏夹列表」获取所有收藏夹，选择特定收藏夹下载
-- 首次使用会弹出浏览器窗口，需要扫码登录抖音（登录状态会自动保存）
-- 点击「创建并立即开始」
-
-> **注意**：抖音视频默认下载无水印版本。图片 CDN 需要有效 Cookie，程序会自动从浏览器提取。
-
-### 7. 下载失败处理
-
-如果部分文件下载失败（如 CDN 链接过期返回 403）：
-
-1. 任务完成后会在下载目录生成 `_下载失败列表.txt` 和 `_failed.json`，记录失败文件和原因
-2. 任务面板中可点击「失败详情」查看完整列表
-3. 点击「重试失败」按钮，程序会**重新打开浏览器获取最新的下载链接**，然后重新下载失败的文件
-4. 成功下载的文件会自动从失败列表中移除
-5. 每次下载自带 3 次自动重试（网络波动时会自动重试，403/404 直接跳过）
-
-## 技术栈
-
-- **后端**: Python / FastAPI / Playwright / aiohttp / SQLite
-- **前端**: Vue 3 / Element Plus / Vite
-
-## 项目结构
-
-```
-MediaCollector/
-├── backend/
-│   ├── app/
-│   │   ├── main.py           # FastAPI 入口
-│   │   ├── config.py         # 配置
-│   │   ├── models.py         # 数据模型
-│   │   ├── database.py       # SQLite 数据库
-│   │   ├── core/             # 核心引擎
-│   │   │   ├── base_provider.py  # Provider 抽象基类
-│   │   │   ├── downloader.py     # 异步下载引擎
-│   │   │   └── task_manager.py   # 任务管理器
-│   │   ├── providers/        # 平台 Provider
-│   │   │   ├── weibo.py      # 微博（Playwright 浏览器引擎）
-│   │   │   └── douyin.py     # 抖音（Playwright + 网络拦截）
-│   │   └── api/              # API 路由
-│   ├── data/                 # 运行时数据
-│   │   ├── weibo_browser/    # Playwright 微博浏览器持久化数据
-│   │   └── douyin_browser/   # Playwright 抖音浏览器持久化数据
-│   └── requirements.txt
-├── frontend/                 # Vue 3 前端
-└── README.md
-```
-
-## 添加新平台
-
-在 `backend/app/providers/` 下新建文件，继承 `BaseProvider` 并实现三个方法：
-
-```python
-class MyProvider(BaseProvider):
-    name = "my_platform"
-    display_name = "我的平台"
-
-    async def parse_target(self, url_or_id: str) -> TargetInfo: ...
-    async def fetch_media_list(self, target, ...) -> list[MediaItem]: ...
-    def get_config_schema(self) -> dict: ...
-```
-
-然后在 `providers/__init__.py` 中注册即可。
+详见[技术架构](ARCHITECTURE.md)。

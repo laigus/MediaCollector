@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
@@ -31,13 +30,6 @@ async def lifespan(app: FastAPI):
         provider = provider_cls()
         task_manager.register_provider(provider)
 
-        config = await db.get_provider_config(provider.name)
-        cookie = config.get("cookie", "")
-        if provider.name == "weibo" and not cookie:
-            cookie = settings.weibo_cookie
-        if cookie and hasattr(provider, "set_cookie"):
-            provider.set_cookie(cookie)
-
     yield
 
     await task_manager.close()
@@ -50,15 +42,6 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 @app.get("/api/health")
 async def health():

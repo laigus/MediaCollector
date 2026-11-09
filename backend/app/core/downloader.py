@@ -124,21 +124,25 @@ class AsyncDownloader:
                     logger.warning("Failed: %s -> %s", item.filename or item.url[:80], msg)
                 return item, ok, msg
 
-        tasks_list = [_download_with_sem(item, i) for i, item in enumerate(items)]
-
-        for coro in asyncio.as_completed(tasks_list):
-            item, ok, msg = await coro
-            if ok:
-                success_count += 1
-            else:
-                fail_count += 1
-                failed_details.append({
-                    "filename": item.filename or "unknown",
-                    "source_id": item.source_id or "",
-                    "url": item.url,
-                    "error": msg,
-                })
-            if progress_callback:
-                await progress_callback(success_count + fail_count, len(items))
+        tasks = [asyncio.create_task(_download_with_sem(item, i)) for i, item in enumerate(items)]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                item, ok, msg = await coro
+                if ok:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    failed_details.append({
+                        "filename": item.filename or "unknown",
+                        "source_id": item.source_id or "",
+                        "error": msg,
+                    })
+                if progress_callback:
+                    await progress_callback(success_count, fail_count, len(items))
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         return success_count, fail_count, failed_details

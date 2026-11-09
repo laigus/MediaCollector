@@ -5,9 +5,10 @@ import json
 import logging
 import random
 import re
-import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse, urlencode
 
@@ -19,19 +20,20 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://m.weibo.cn/api/container/getIndex"
 _BROWSER_DATA_DIR = str(Path(__file__).parent.parent.parent / "data" / "weibo_browser")
 _executor = ThreadPoolExecutor(max_workers=1)
-_browser_lock = threading.Lock()
 
 
-def _sync_browser_request(url: str, cookie: str, need_login: bool = False) -> dict:
-    """在独立线程中用 Playwright sync API 请求微博。"""
+_CONFIG_URL = "https://m.weibo.cn/api/config"
+
+
+@contextmanager
+def _open_browser(*, headless: bool):
     from playwright.sync_api import sync_playwright
 
     Path(_BROWSER_DATA_DIR).mkdir(parents=True, exist_ok=True)
-
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             _BROWSER_DATA_DIR,
-            headless=not need_login,
+            headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
             locale="zh-CN",
             user_agent=(
@@ -40,78 +42,100 @@ def _sync_browser_request(url: str, cookie: str, need_login: bool = False) -> di
                 "Chrome/135.0.0.0 Safari/537.36"
             ),
         )
-
-        if cookie:
-            cookies = []
-            for part in cookie.split(";"):
-                part = part.strip()
-                if "=" not in part:
-                    continue
-                name, value = part.split("=", 1)
-                cookies.append({
-                    "name": name.strip(),
-                    "value": value.strip(),
-                    "domain": ".weibo.cn",
-                    "path": "/",
-                })
-            if cookies:
-                context.add_cookies(cookies)
-
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(url, wait_until="domcontentloaded")
-        text = page.inner_text("body")
-
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            context.close()
-            raise ValueError(f"非 JSON 响应: {text[:200]}")
-
-        if data.get("ok") == -100 or data.get("errno") == "-100":
+            yield context, context.pages[0] if context.pages else context.new_page()
+        finally:
             context.close()
 
-            logger.warning("需要验证码/登录，弹出浏览器窗口...")
-            context2 = p.chromium.launch_persistent_context(
-                _BROWSER_DATA_DIR,
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-                locale="zh-CN",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/135.0.0.0 Safari/537.36"
-                ),
-            )
 
-            page2 = context2.pages[0] if context2.pages else context2.new_page()
-            redirect_url = data.get("url", "")
-            if "captcha" in redirect_url:
-                page2.goto(redirect_url)
-            else:
-                page2.goto("https://m.weibo.cn/")
+def _read_json(page, url: str) -> dict:
+    page.goto(url, wait_until="domcontentloaded")
+    try:
+        result = json.loads(page.inner_text("body", timeout=8000))
+    except json.JSONDecodeError as exc:
+        raise ValueError("微博未返回预期数据，请在微博窗口登录后重试") from exc
+    if not isinstance(result, dict):
+        raise ValueError("微博未返回预期数据，请重试")
+    return result
 
-            logger.info("请在弹出的浏览器中完成验证码/登录（最多等待 120 秒）...")
-            for i in range(120):
-                page2.wait_for_timeout(1000)
-                current_url = page2.url
-                if "captcha" not in current_url and "login" not in current_url and i > 3:
-                    break
-                if i % 10 == 0:
-                    logger.info("  等待中... (%ds) url=%s", i, current_url[:80])
 
-            page2.goto(url, wait_until="domcontentloaded")
-            text2 = page2.inner_text("body")
-            data = json.loads(text2)
-
-            context2.close()
-
-            if data.get("ok") != 1:
-                raise ValueError(
-                    f"验证后仍然失败: ok={data.get('ok')}, errno={data.get('errno')}"
-                )
+def _logged_in(page) -> bool:
+    url = urlparse(page.url)
+    if url.hostname != "m.weibo.cn":
+        return False
+    try:
+        if url.path == "/api/config":
+            data = json.loads(page.inner_text("body", timeout=2000))
         else:
-            context.close()
+            data = page.evaluate("""async () => {
+                const response = await fetch('/api/config', {
+                    cache: 'no-store', signal: AbortSignal.timeout(4000)
+                });
+                return response.json();
+            }""")
+        return (data.get("data") or {}).get("login") is True
+    except Exception:
+        return False
 
+
+def _login_in_browser(context, page) -> None:
+    from playwright.sync_api import Error
+
+    try:
+        config = _read_json(page, _CONFIG_URL).get("data") or {}
+        if config.get("login") is True:
+            return
+        login_url = config.get("loginUrl") or ""
+        login_page = urlparse(login_url)
+        if login_page.scheme != "https" or login_page.hostname not in {"passport.weibo.com", "passport.weibo.cn"}:
+            raise ValueError("微博未返回登录入口，请重试")
+        page.goto(login_url, wait_until="domcontentloaded")
+
+        deadline = monotonic() + 180
+        while monotonic() < deadline:
+            pages = [candidate for candidate in context.pages if not candidate.is_closed()]
+            if not pages:
+                raise ValueError("微博登录窗口已关闭")
+            if any(_logged_in(candidate) for candidate in pages):
+                return
+            pages[0].wait_for_timeout(1000)
+    except Error as exc:
+        if page.is_closed():
+            raise ValueError("微博登录窗口已关闭") from exc
+        raise
+    raise ValueError("微博登录超时，请重新打开登录窗口")
+
+
+def _sync_login() -> None:
+    with _open_browser(headless=False) as (context, page):
+        _login_in_browser(context, page)
+
+
+def _needs_verification(data: dict) -> bool:
+    return str(data.get("ok")) == "-100" or str(data.get("errno")) == "-100"
+
+
+def _sync_browser_request(url: str) -> dict:
+    with _open_browser(headless=True) as (_, page):
+        data = _read_json(page, url)
+    if not _needs_verification(data):
+        return data
+
+    with _open_browser(headless=False) as (context, page):
+        redirect_url = data.get("url") or ""
+        redirect = urlparse(redirect_url)
+        if redirect.scheme == "https" and redirect.hostname == "m.weibo.cn" and "captcha" in redirect.path:
+            page.goto(redirect_url, wait_until="domcontentloaded")
+            deadline = monotonic() + 120
+            while "captcha" in urlparse(page.url).path:
+                if monotonic() >= deadline:
+                    raise ValueError("微博验证超时，请重新下载")
+                page.wait_for_timeout(1000)
+        else:
+            _login_in_browser(context, page)
+        data = _read_json(page, url)
+        if _needs_verification(data):
+            raise ValueError("微博仍需登录或验证，请完成后重试")
         return data
 
 
@@ -120,28 +144,18 @@ class WeiboProvider(BaseProvider):
     display_name = "微博"
     description = "从微博用户主页批量下载原图（使用浏览器引擎）"
 
-    def __init__(self) -> None:
-        self._cookie: str = ""
-
-    def set_cookie(self, cookie: str) -> None:
-        self._cookie = cookie
+    async def login(self) -> None:
+        await asyncio.get_running_loop().run_in_executor(_executor, _sync_login)
 
     async def _api_get(self, params: dict[str, Any]) -> dict:
         qs = urlencode(params)
         url = f"{_BASE_URL}?{qs}"
-        loop = asyncio.get_event_loop()
-        with _browser_lock:
-            data = await loop.run_in_executor(
-                _executor,
-                _sync_browser_request,
-                url,
-                self._cookie,
-                False,
-            )
-        return data
+        return await asyncio.get_running_loop().run_in_executor(
+            _executor, _sync_browser_request, url
+        )
 
     @staticmethod
-    def _extract_uid(url_or_id: str) -> str:
+    def extract_uid(url_or_id: str) -> str:
         url_or_id = url_or_id.strip()
         if url_or_id.isdigit():
             return url_or_id
@@ -164,7 +178,7 @@ class WeiboProvider(BaseProvider):
         raise ValueError(f"无法从 URL 中提取用户 ID: {url_or_id}")
 
     async def parse_target(self, url_or_id: str) -> TargetInfo:
-        uid = self._extract_uid(url_or_id)
+        uid = self.extract_uid(url_or_id)
         logger.info("parse_target: uid=%s", uid)
 
         display_name = uid
@@ -199,7 +213,6 @@ class WeiboProvider(BaseProvider):
         *,
         start_page: int = 1,
         end_page: int = 0,
-        downloaded_ids: set[str] | None = None,
         progress_callback: Any = None,
     ) -> list[MediaItem]:
         container_id = target.extra.get("container_id", f"107603{target.target_id}")
@@ -225,6 +238,8 @@ class WeiboProvider(BaseProvider):
                 data = await self._api_get(params)
             except Exception as e:
                 logger.error("Fetch page %d failed: %s", page, e)
+                if not media_items:
+                    raise
                 break
 
             if data.get("ok") != 1:
@@ -306,26 +321,5 @@ class WeiboProvider(BaseProvider):
 
         return media_items
 
-    def get_download_headers(self) -> dict[str, str] | None:
-        headers = {"Referer": "https://weibo.com/"}
-        if self._cookie:
-            headers["Cookie"] = self._cookie
-        return headers
-
-    def get_config_schema(self) -> dict[str, Any]:
-        return {
-            "cookie": {
-                "type": "string",
-                "title": "微博 Cookie（可选）",
-                "description": (
-                    "可选：如果不填，首次运行时会弹出浏览器让你登录。"
-                    "如需手动填写：登录 m.weibo.cn → F12 → Network → 复制 Cookie"
-                ),
-            }
-        }
-
-    async def validate_config(self, config: dict[str, Any]) -> bool:
-        return True
-
-    async def close(self) -> None:
-        pass
+    def get_download_headers(self) -> dict[str, str]:
+        return {"Referer": "https://weibo.com/"}

@@ -1,26 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
 from app.config import settings
 from app.core.downloader import AsyncDownloader
-from app.models import TaskCreate, TaskInfo, TaskStatus
+from app.models import MediaItem, TargetInfo, TaskCreate, TaskInfo, TaskStatus
 
 logger = logging.getLogger(__name__)
 
 
 class TaskManager:
-    """管理下载任务的生命周期。"""
-
     def __init__(self) -> None:
         self._providers: dict[str, Any] = {}
-        self._downloader = AsyncDownloader(
-            max_concurrent=settings.max_concurrent_downloads
-        )
+        self._downloader = AsyncDownloader(max_concurrent=settings.max_concurrent_downloads)
         self._running_tasks: dict[int, asyncio.Task] = {}
         self._db: Any = None
 
@@ -33,360 +28,181 @@ class TaskManager:
     def get_provider(self, name: str) -> Any | None:
         return self._providers.get(name)
 
-    def list_providers(self) -> list[Any]:
-        return list(self._providers.values())
+    async def destination(self, provider_name: str, target_id: str | None = None) -> str:
+        config = await self._db.get_provider_config(provider_name)
+        specific = config.get("source_download_dirs", {}).get(target_id)
+        return specific or config.get("download_dir") or ""
 
-    async def create_task(self, task_create: TaskCreate) -> TaskInfo:
-        provider = self._providers.get(task_create.provider)
-        if not provider:
-            raise ValueError(f"Unknown provider: {task_create.provider}")
+    async def _require_destination(self, provider_name: str, target_id: str | None = None) -> Path:
+        directory = await self.destination(provider_name, target_id)
+        if not directory:
+            raise ValueError("请先选择下载文件夹")
+        return Path(directory)
 
-        target = await provider.parse_target(task_create.target_url)
-
-        save_dir = task_create.save_dir or str(
-            Path(settings.download_dir) / provider.display_name / target.display_name
+    async def download_weibo(self, body: TaskCreate) -> TaskInfo:
+        if body.end_page and body.end_page < body.start_page:
+            raise ValueError("结束页须大于或等于起始页")
+        source = body.target_url.strip()
+        if not source:
+            raise ValueError("请输入微博主页链接或用户 ID")
+        uid = self._providers["weibo"].extract_uid(source)
+        target = TargetInfo(provider="weibo", target_id=uid, display_name=uid)
+        return await self._start(
+            target, source, await self._require_destination("weibo"),
+            body.start_page, body.end_page,
         )
 
-        task_info = TaskInfo(
-            provider=task_create.provider,
-            target_url=task_create.target_url,
+    async def download_selection(self, source: str, work_ids: list[str]) -> TaskInfo:
+        provider = self._providers["douyin"]
+        target = await provider.parse_target(source)
+        catalog = await self._db.get_douyin_catalog(target.target_id)
+        available = {work["id"] for work in catalog["works"]} if catalog else set()
+        selected = list(dict.fromkeys(work_ids))
+        if not available.issuperset(selected):
+            raise ValueError("有作品不在当前列表，请刷新后重新选择")
+        directory = await self._require_destination("douyin", target.target_id)
+        media = provider.cached_selection(target, selected)
+        return await self._start(target, source, directory, prepared=media, selected_work_ids=selected)
+
+    async def _start(
+        self,
+        target: TargetInfo,
+        source: str,
+        save_dir: Path,
+        start_page: int = 1,
+        end_page: int = 0,
+        prepared: list[MediaItem] | None = None,
+        selected_work_ids: list[str] | None = None,
+    ) -> TaskInfo:
+        task = await self._db.create_task(TaskInfo(
+            provider=target.provider,
+            target_url=source,
             target_name=target.display_name,
-            save_dir=save_dir,
-            status=TaskStatus.PENDING,
-            start_page=task_create.start_page,
-            end_page=task_create.end_page,
+            save_dir=str(save_dir),
+            status=TaskStatus.RUNNING,
+            start_page=start_page,
+            end_page=end_page,
+            total_count=len(prepared or []),
+            progress_message="正在准备下载",
+        ))
+        self._running_tasks[task.id] = asyncio.create_task(
+            self._run(task, prepared, selected_work_ids=selected_work_ids)
         )
+        return task
 
-        if self._db:
-            task_info = await self._db.create_task(task_info)
-
-        return task_info
-
-    async def start_task(self, task_id: int) -> TaskInfo:
-        if not self._db:
-            raise RuntimeError("Database not initialized")
-
-        task_info = await self._db.get_task(task_id)
-        if not task_info:
-            raise ValueError(f"Task {task_id} not found")
-
-        if task_id in self._running_tasks:
-            return task_info
-
-        bg_task = asyncio.create_task(self._run_task(task_info))
-        self._running_tasks[task_id] = bg_task
-        return task_info
-
-    async def _run_task(self, task_info: TaskInfo) -> None:
-        task_id = task_info.id
+    async def _run(
+        self,
+        task: TaskInfo,
+        prepared: list[MediaItem] | None = None,
+        previous_failures: list[dict] | None = None,
+        selected_work_ids: list[str] | None = None,
+    ) -> None:
         try:
-            await self._db.update_task(
-                task_id, status=TaskStatus.RUNNING, progress_message="正在解析目标..."
-            )
+            provider = self._providers[task.provider]
+            if prepared is None and selected_work_ids is not None:
+                target = await provider.parse_target(task.target_url)
+                await self._db.update_task(task.id, progress_message="正在获取所选作品的下载链接")
+                media = await provider.fetch_selection(target, selected_work_ids)
+            elif prepared is None:
+                target = await provider.parse_target(task.target_url)
+                if previous_failures is None:
+                    await self._db.update_task(task.id, target_name=target.display_name)
 
-            provider = self._providers.get(task_info.provider)
-            if not provider:
-                raise ValueError(f"Provider not found: {task_info.provider}")
+                async def on_fetch_progress(count: int, message: str) -> None:
+                    await self._db.update_task(task.id, progress_message=f"{message} · 已发现 {count} 个文件")
 
-            target = await provider.parse_target(task_info.target_url)
+                media = await provider.fetch_media_list(
+                    target, start_page=task.start_page, end_page=task.end_page,
+                    progress_callback=on_fetch_progress,
+                )
+            else:
+                media = prepared
 
-            downloaded_ids = set()
+            unmatched = []
+            already_downloaded = 0
+            if previous_failures is not None:
+                wanted = {item["source_id"] for item in previous_failures}
+                media = [item for item in media if item.source_id in wanted]
+                found = {item.source_id for item in media}
+                unmatched = [
+                    {**item, "error": "作品已不在当前列表或链接已失效"}
+                    for item in previous_failures if item["source_id"] not in found
+                ]
+                already_downloaded = task.downloaded_count
 
-            async def on_fetch_progress(count: int, msg: str) -> None:
-                logger.info("Task %d fetch progress: %d - %s", task_id, count, msg)
+            if media:
                 await self._db.update_task(
-                    task_id, progress_message=f"正在抓取列表: {msg}（已发现 {count} 个文件）"
+                    task.id,
+                    total_count=already_downloaded + len(media) + len(unmatched),
+                    progress_message="正在下载",
                 )
 
-            media_list = await provider.fetch_media_list(
-                target,
-                start_page=task_info.start_page,
-                end_page=task_info.end_page,
-                downloaded_ids=downloaded_ids,
-                progress_callback=on_fetch_progress,
-            )
+                async def on_download_progress(success: int, failed: int, total: int) -> None:
+                    counts = {}
+                    if previous_failures is None:
+                        counts = {"downloaded_count": success, "failed_count": failed}
+                    action = "正在重试" if previous_failures is not None else "正在下载"
+                    await self._db.update_task(task.id, progress_message=f"{action} · {success + failed}/{total}", **counts)
 
-            await self._db.update_task(
-                task_id,
-                total_count=len(media_list),
-                progress_message=f"列表抓取完成，共 {len(media_list)} 个文件，准备下载...",
-            )
-
-            if not media_list:
-                await self._db.update_task(
-                    task_id, status=TaskStatus.COMPLETED, progress_message="未发现新内容"
+                headers = provider.get_download_headers()
+                success, _, failed_items = await self._downloader.download_batch(
+                    media, Path(task.save_dir), headers=headers, progress_callback=on_download_progress
                 )
-                return
+            else:
+                success, failed_items = 0, []
 
-            save_dir = Path(task_info.save_dir)
-
-            async def on_download_progress(done: int, total: int) -> None:
-                await self._db.update_task(
-                    task_id,
-                    downloaded_count=done,
-                    progress_message=f"正在下载: {done}/{total}",
-                )
-
-            download_headers = None
-            if hasattr(provider, "get_download_headers_async"):
-                download_headers = await provider.get_download_headers_async()
-            elif hasattr(provider, "get_download_headers"):
-                download_headers = provider.get_download_headers()
-
-            success, failed, failed_details = await self._downloader.download_batch(
-                media_list,
-                save_dir,
-                headers=download_headers,
-                progress_callback=on_download_progress,
-            )
-
-            for item in media_list:
-                if item.source_id:
-                    await self._db.add_downloaded_id(task_id, item.source_id)
-
-            self._save_failed_report(save_dir, failed_details)
-
-            progress_msg = f"完成！成功 {success}，失败 {failed}"
-            if failed_details:
-                failed_names = [d["filename"] for d in failed_details[:10]]
-                progress_msg += "\n失败文件: " + "、".join(failed_names)
-                if len(failed_details) > 10:
-                    progress_msg += f"...等共 {len(failed_details)} 个"
-                progress_msg += f"\n详见: _下载失败列表.txt"
-
+            failures = [
+                {key: item[key] for key in ("source_id", "filename", "error")}
+                for item in failed_items
+            ] + unmatched
+            downloaded = already_downloaded + success
+            await self._db.save_task_failures(task.id, failures)
             await self._db.update_task(
-                task_id,
+                task.id,
                 status=TaskStatus.COMPLETED,
-                downloaded_count=success,
-                failed_count=failed,
-                progress_message=progress_msg,
+                downloaded_count=downloaded,
+                failed_count=len(failures),
+                progress_message=(
+                    f"已保存 {downloaded} 个文件，{len(failures)} 个失败" if failures
+                    else f"已保存 {downloaded} 个文件" if downloaded else "没有找到可下载的内容"
+                ),
             )
-            logger.info(
-                "Task %d completed: %d success, %d failed", task_id, success, failed
-            )
-
-        except Exception as e:
-            logger.exception("Task %d failed: %s", task_id, e)
+        except Exception as exc:
+            logger.exception("Download %d failed", task.id)
             await self._db.update_task(
-                task_id,
-                status=TaskStatus.FAILED,
-                error_message=str(e),
-                progress_message=f"失败: {e}",
+                task.id, status=TaskStatus.FAILED, error_message=str(exc), progress_message=str(exc)
             )
         finally:
-            self._running_tasks.pop(task_id, None)
-
-    @staticmethod
-    def _parse_failed_txt(txt_path: Path) -> list[dict]:
-        """从纯文本失败报告中解析出失败项（兼容旧格式）。"""
-        import re
-        content = txt_path.read_text(encoding="utf-8")
-        items = []
-        current: dict | None = None
-        for line in content.splitlines():
-            m = re.match(r'^\d+\.\s+(.+)', line)
-            if m:
-                if current:
-                    items.append(current)
-                current = {"filename": m.group(1).strip(), "url": "", "error": ""}
-            elif current and line.strip().startswith("错误:"):
-                current["error"] = line.strip().removeprefix("错误:").strip()
-            elif current and line.strip().startswith("URL:"):
-                current["url"] = line.strip().removeprefix("URL:").strip()
-        if current and current.get("url"):
-            items.append(current)
-        return items
-
-    @staticmethod
-    def _save_failed_report(save_dir: Path, failed_details: list[dict]) -> None:
-        """保存失败列表为 txt（可读）和 json（机器可读）。"""
-        json_path = save_dir / "_failed.json"
-        txt_path = save_dir / "_下载失败列表.txt"
-
-        if not failed_details:
-            for p in (json_path, txt_path):
-                if p.exists():
-                    p.unlink()
-            return
-
-        json_path.write_text(
-            json.dumps(failed_details, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        lines = [f"下载失败文件列表（共 {len(failed_details)} 个）\n"]
-        lines.append("=" * 60 + "\n")
-        for i, detail in enumerate(failed_details, 1):
-            lines.append(f"\n{i}. {detail['filename']}")
-            lines.append(f"   错误: {detail['error']}")
-            lines.append(f"   URL: {detail['url']}")
-        txt_path.write_text("\n".join(lines), encoding="utf-8")
-
-    async def retry_failed(self, task_id: int) -> dict:
-        """重试下载失败的文件：重新获取最新 URL 再下载。"""
-        if not self._db:
-            raise RuntimeError("Database not initialized")
-
-        task_info = await self._db.get_task(task_id)
-        if not task_info:
-            raise ValueError(f"Task {task_id} not found")
-
-        save_dir = Path(task_info.save_dir)
-        json_path = save_dir / "_failed.json"
-        txt_path = save_dir / "_下载失败列表.txt"
-
-        failed_items_raw: list[dict] = []
-        if json_path.exists():
-            failed_items_raw = json.loads(json_path.read_text(encoding="utf-8"))
-        elif txt_path.exists():
-            failed_items_raw = self._parse_failed_txt(txt_path)
-
-        if not failed_items_raw:
-            return {"retried": 0, "success": 0, "still_failed": 0}
-
-        failed_source_ids = {
-            item.get("source_id", "")
-            for item in failed_items_raw
-            if item.get("source_id")
-        }
-        failed_filenames = {item.get("filename", "") for item in failed_items_raw}
-        total_to_retry = len(failed_items_raw)
-
-        provider = self._providers.get(task_info.provider)
-        if not provider:
-            raise ValueError(f"Provider not found: {task_info.provider}")
-
-        await self._db.update_task(
-            task_id,
-            status=TaskStatus.RUNNING,
-            progress_message=f"正在重新获取 {total_to_retry} 个失败文件的最新链接...",
-        )
-
-        target = await provider.parse_target(task_info.target_url)
-
-        async def on_fetch_progress(count: int, msg: str) -> None:
-            await self._db.update_task(
-                task_id,
-                progress_message=f"正在重新加载内容: {msg}（已发现 {count} 个文件）",
-            )
-
-        fresh_media_list = await provider.fetch_media_list(
-            target,
-            start_page=task_info.start_page,
-            end_page=task_info.end_page,
-            progress_callback=on_fetch_progress,
-        )
-
-        retry_items = []
-        if failed_source_ids:
-            for item in fresh_media_list:
-                if item.source_id in failed_source_ids:
-                    retry_items.append(item)
-        else:
-            fresh_by_name = {item.filename: item for item in fresh_media_list}
-            for fname in failed_filenames:
-                if fname in fresh_by_name:
-                    retry_items.append(fresh_by_name[fname])
-
-        if not retry_items:
-            await self._db.update_task(
-                task_id,
-                status=TaskStatus.COMPLETED,
-                progress_message=f"重试失败：无法重新获取失败文件的链接（可能已被删除）",
-            )
-            return {"retried": 0, "success": 0, "still_failed": total_to_retry}
-
-        await self._db.update_task(
-            task_id,
-            progress_message=f"已重新获取 {len(retry_items)} 个文件的最新链接，开始下载...",
-        )
-
-        download_headers = None
-        if hasattr(provider, "get_download_headers_async"):
-            download_headers = await provider.get_download_headers_async()
-        elif hasattr(provider, "get_download_headers"):
-            download_headers = provider.get_download_headers()
-
-        async def on_download_progress(done: int, total: int) -> None:
-            await self._db.update_task(
-                task_id,
-                progress_message=f"正在重试下载: {done}/{total}",
-            )
-
-        _, _, new_failed = await self._downloader.download_batch(
-            retry_items,
-            save_dir,
-            headers=download_headers,
-            progress_callback=on_download_progress,
-        )
-
-        matched_source_ids = {item.source_id for item in retry_items}
-        unmatched = [
-            raw for raw in failed_items_raw
-            if raw.get("source_id", "") not in matched_source_ids
-            and raw.get("filename", "") not in {item.filename for item in retry_items}
-        ]
-
-        still_failed = new_failed + [
-            {**item, "error": "无法重新获取链接"}
-            for item in unmatched
-        ]
-
-        success_count = len(retry_items) - len(new_failed)
-
-        self._save_failed_report(save_dir, still_failed)
-
-        new_downloaded = task_info.downloaded_count + success_count
-        new_fail_count = len(still_failed)
-
-        if still_failed:
-            failed_names = [d["filename"] for d in still_failed[:10]]
-            msg = (
-                f"重试完成！本次成功 {success_count}，仍失败 {new_fail_count}\n"
-                f"失败文件: {'、'.join(failed_names)}"
-            )
-            if len(still_failed) > 10:
-                msg += f"...等共 {new_fail_count} 个"
-            msg += "\n详见: _下载失败列表.txt"
-        else:
-            msg = f"重试完成！全部 {success_count} 个文件下载成功"
-
-        await self._db.update_task(
-            task_id,
-            status=TaskStatus.COMPLETED,
-            downloaded_count=new_downloaded,
-            failed_count=new_fail_count,
-            progress_message=msg,
-        )
-
-        return {
-            "retried": total_to_retry,
-            "success": success_count,
-            "still_failed": new_fail_count,
-        }
+            self._running_tasks.pop(task.id, None)
 
     async def get_task(self, task_id: int) -> TaskInfo | None:
-        if self._db:
-            return await self._db.get_task(task_id)
-        return None
+        return await self._db.get_task(task_id)
 
-    async def list_tasks(self) -> list[TaskInfo]:
-        if self._db:
-            return await self._db.list_tasks()
-        return []
+    async def get_failures(self, task_id: int) -> list[dict]:
+        return await self._db.get_task_failures(task_id)
 
-    async def delete_task(self, task_id: int) -> bool:
-        if task_id in self._running_tasks:
-            self._running_tasks[task_id].cancel()
-            self._running_tasks.pop(task_id, None)
-        if self._db:
-            return await self._db.delete_task(task_id)
-        return False
+    async def retry_failed(self, task_id: int) -> TaskInfo:
+        task = await self.get_task(task_id)
+        if not task:
+            raise LookupError("下载记录不存在")
+        if task_id in self._running_tasks or task.status == TaskStatus.RUNNING:
+            return task
+        failures = await self.get_failures(task_id)
+        if not failures:
+            raise ValueError("这次下载没有可重试的失败文件")
+        task.status = TaskStatus.RUNNING
+        task.progress_message = "正在重新加载失败文件的链接"
+        await self._db.update_task(
+            task_id, status=task.status, error_message="", progress_message=task.progress_message
+        )
+        self._running_tasks[task_id] = asyncio.create_task(self._run(task, previous_failures=failures))
+        return task
 
     async def close(self) -> None:
-        for t in self._running_tasks.values():
-            t.cancel()
-        self._running_tasks.clear()
+        running = list(self._running_tasks.values())
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
         await self._downloader.close()
-        for p in self._providers.values():
-            await p.close()
+        for provider in self._providers.values():
+            await provider.close()

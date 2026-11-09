@@ -37,11 +37,31 @@ class MediaItem(BaseModel):
 
 
 class TaskCreate(BaseModel):
-    provider: str
-    target_url: str
-    save_dir: str = ""
-    start_page: int = 1
-    end_page: int = 0
+    target_url: str = Field(min_length=1)
+    start_page: int = Field(default=1, ge=1)
+    end_page: int = Field(default=0, ge=0)
+
+
+class DouyinDownload(BaseModel):
+    source: str = Field(min_length=1, max_length=256)
+    work_ids: list[str] = Field(min_length=1)
+
+
+class DouyinWork(BaseModel):
+    id: str
+    title: str
+    author: str
+    cover_url: str = ""
+    kind: MediaType
+    file_count: int
+    duration_seconds: int = 0
+
+
+class DouyinSession(BaseModel):
+    logged_in: bool
+    nickname: str = ""
+    account_id: str = ""
+    avatar_url: str = ""
 
 
 class TaskInfo(BaseModel):
@@ -62,14 +82,5 @@ class TaskInfo(BaseModel):
     progress_message: str = ""
 
 
-class ProviderInfo(BaseModel):
-    name: str
-    display_name: str
-    description: str = ""
-    config_schema: dict[str, Any] = Field(default_factory=dict)
-    enabled: bool = True
-
-
-class ProviderConfigUpdate(BaseModel):
-    provider: str
-    config: dict[str, Any]
+class FolderSelection(BaseModel):
+    source: str | None = Field(default=None, min_length=1, max_length=256)
